@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
-    private val incomingReqeustsCounter: Counter = Counter
+    private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
         .description("Количество завершенных входящих запросов")
         .tags("account", properties.accountName)
@@ -72,7 +72,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-        incomingReqeustsCounter.increment()
+        incomingRequestsCounter.increment()
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {
@@ -150,6 +150,10 @@ class PaymentExternalSystemAdapterImpl(
     override fun price() = properties.price
 
     override fun isEnabled() = properties.enabled
+
+    override fun rateLimitPerSec(): Int {
+        return properties.rateLimitPerSec
+    }
 
     override fun name() = properties.accountName
 }

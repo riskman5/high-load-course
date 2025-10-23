@@ -5,8 +5,10 @@ import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
 import ru.quipy.common.utils.CallerBlockingRejectedExecutionHandler
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.common.utils.NamedThreadFactory
-import ru.quipy.common.utils.SlidingWindowRateLimiter
+import ru.quipy.common.utils.RateLimiter
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
 import java.time.Duration
@@ -28,9 +30,10 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val rateLimiter: SlidingWindowRateLimiter = SlidingWindowRateLimiter(
+    private var rateLimiter: RateLimiter = LeakingBucketRateLimiter(
         11,
-        window = Duration.ofSeconds(1)
+        window = Duration.ofSeconds(1),
+        bucketSize = 270,
     )
 
     private val paymentExecutor = ThreadPoolExecutor(

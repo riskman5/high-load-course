@@ -3,9 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
-import io.micrometer.core.instrument.binder.MeterBinder
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -46,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
-    private val incomingReqeustsCounter: Counter = Counter
+    private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
         .description("Количество завершенных входящих запросов")
         .tags("account", properties.accountName)
@@ -72,7 +70,7 @@ class PaymentExternalSystemAdapterImpl(
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
-        incomingReqeustsCounter.increment()
+        incomingRequestsCounter.increment()
         // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
         // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
         paymentESService.update(paymentId) {

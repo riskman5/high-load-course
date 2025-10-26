@@ -3,9 +3,12 @@ package ru.quipy.apigateway
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.http.HttpStatus
+import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.ShouldRetryAfterException
 import java.util.*
 
 @RestController
@@ -71,4 +74,13 @@ class APIController {
         val timestamp: Long,
         val transactionId: UUID
     )
+
+    @ExceptionHandler(ShouldRetryAfterException::class)
+    fun handleTooManyRequestsException(e: ShouldRetryAfterException): ResponseEntity<Any> {
+        logger.warn("Too many requests: {}", e.message)
+
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", e.retryAfter.toString())
+            .build();
+    }
 }

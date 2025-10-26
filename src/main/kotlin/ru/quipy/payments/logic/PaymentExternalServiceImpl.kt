@@ -3,9 +3,7 @@ package ru.quipy.payments.logic
 import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
-import io.micrometer.core.instrument.Gauge
 import io.micrometer.core.instrument.MeterRegistry
-import io.micrometer.core.instrument.binder.MeterBinder
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
@@ -150,10 +148,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun price() = properties.price
 
     override fun isEnabled() = properties.enabled
-
-    override fun rateLimitPerSec(): Int {
-        return properties.rateLimitPerSec
-    }
 
     override fun name() = properties.accountName
 }

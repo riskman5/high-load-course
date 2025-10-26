@@ -8,6 +8,7 @@ import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
+import ru.quipy.payments.logic.ShouldRetryAfterException
 import java.util.*
 
 @RestController
@@ -57,7 +58,7 @@ class APIController {
     }
 
     @PostMapping("/orders/{orderId}/payment")
-    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+    fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): PaymentSubmissionDto {
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
@@ -66,16 +67,20 @@ class APIController {
 
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
-        val timestamp = System.currentTimeMillis() + 1000
-        if (createdAt == null) {
-            return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", timestamp.toString()).build();
-        }
-        return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
+        return PaymentSubmissionDto(createdAt, paymentId)
     }
 
     class PaymentSubmissionDto(
         val timestamp: Long,
         val transactionId: UUID
     )
+
+    @ExceptionHandler(ShouldRetryAfterException::class)
+    fun handleTooManyRequestsException(e: ShouldRetryAfterException): ResponseEntity<Any> {
+        logger.warn("Too many requests: {}", e.message)
+
+        return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+            .header("Retry-After", e.retryAfter.toString())
+            .build();
+    }
 }

@@ -6,13 +6,13 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "branch": "hw-04",
-  "ratePerSecond": 16,
-  "testCount": 1600,
-  "processingTimeMillis": 30000,
-  "accounts": "acc-23"
+  "branch": "hw-06",
+  "accounts": "acc-8",
+  "ratePerSecond": 7,
+  "testCount": 800,
+  "processingTimeMillis": 3500,
+  "onPremises": true
 }
-
 ### Stop running test to save credits
 # @timeout 120
 POST http://77.234.215.138:31234/test/stop/{{serviceName}}

@@ -16,6 +16,7 @@ import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
+import io.micrometer.core.instrument.Timer
 
 
 // Advice: always treat time as a Duration
@@ -41,7 +42,9 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val retryAfterMillis: Long = 1000
 
-    private val client = OkHttpClient.Builder().build()
+    private val client = OkHttpClient.Builder()
+        .readTimeout(Duration.ofMillis(1500))
+        .build()
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
@@ -65,6 +68,11 @@ class PaymentExternalSystemAdapterImpl(
         .description("Количество завершенных исходящих запросов")
         .tags("account", properties.accountName)
         .register(meterRegistry)
+    private val clientReqeustLatency: Timer =
+        Timer.builder("client.request.latency")
+            .description("Request latency.")
+            .publishPercentiles(0.5, 0.8, 0.9)
+            .register(meterRegistry)
 
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
@@ -83,7 +91,11 @@ class PaymentExternalSystemAdapterImpl(
         var attempt = 0
         var success = false
 
-        while (attempt < 2 && !success) {
+        while ((deadline - System.currentTimeMillis() >= 0) &&
+            attempt < 3 && !success
+        ) {
+            val clientRequestStart = System.currentTimeMillis()
+
             try {
                 if (!ongoingWindow.acquire(
                         deadline - now() - requestAverageProcessingTime.toMillis(),
@@ -113,10 +125,12 @@ class PaymentExternalSystemAdapterImpl(
                 }
 
                 outgoingRequestsCounter.increment()
+
                 val request = Request.Builder().run {
                     url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
                     post(emptyBody)
                 }.build()
+
 
                 client.newCall(request).execute().use { response ->
                     val body = try {
@@ -157,8 +171,10 @@ class PaymentExternalSystemAdapterImpl(
                     }
                 }
                 attempt++
-            }
-            finally {
+            } finally {
+                val clientRequestFinish = System.currentTimeMillis()
+
+                clientReqeustLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
                 ongoingWindow.release()
                 incomingFinishedRequestsCounter.increment()
                 outgoingFinishedRequestsCounter.increment()

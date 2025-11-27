@@ -40,7 +40,6 @@ class SlidingWindowRateLimiter(
 
         while (!tick()) {
             Thread.sleep(10)
-
             if (now() > start + timeoutMillis) {
                 return false
             }
@@ -48,6 +47,7 @@ class SlidingWindowRateLimiter(
 
         return true
     }
+
     data class Measure(
         val value: Long,
         val timestamp: Long

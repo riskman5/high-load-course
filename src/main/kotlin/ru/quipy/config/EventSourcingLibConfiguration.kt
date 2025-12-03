@@ -2,10 +2,9 @@ package ru.quipy.config
 
 import jakarta.annotation.PostConstruct
 import org.eclipse.jetty.http2.server.HTTP2CServerConnectionFactory
-import org.eclipse.jetty.server.ServerConnector
-import org.eclipse.jetty.util.thread.QueuedThreadPool
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
+import org.springframework.boot.web.embedded.jetty.JettyServerCustomizer
 import org.springframework.boot.web.embedded.jetty.JettyServletWebServerFactory
 import org.springframework.context.annotation.Bean
 import org.springframework.context.annotation.Configuration
@@ -71,23 +70,11 @@ class EventSourcingLibConfiguration {
     fun jettyServerCustomizer(): JettyServletWebServerFactory {
         val jettyServletWebServerFactory = JettyServletWebServerFactory()
 
-        jettyServletWebServerFactory.addServerCustomizers({ server ->
-            val threadPool = server.threadPool as QueuedThreadPool
-            threadPool.minThreads = 500
-            threadPool.maxThreads = 2000
-            threadPool.idleTimeout = 60000
-            threadPool.isDetailedDump = true
+        val c = JettyServerCustomizer {
+            (it.connectors[0].getConnectionFactory("h2c") as HTTP2CServerConnectionFactory).maxConcurrentStreams = 10_000_000
+        }
 
-            server.connectors.forEach { connector ->
-                if (connector is ServerConnector) {
-                    connector.connectionFactories.forEach { c ->
-                        if (c is HTTP2CServerConnectionFactory) {
-                            c.maxConcurrentStreams = 200_000
-                        }
-                    }
-                }
-            }
-        })
+        jettyServletWebServerFactory.serverCustomizers.add(c)
         return jettyServletWebServerFactory
     }
 }

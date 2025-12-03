@@ -20,6 +20,8 @@ import okhttp3.ConnectionPool
 import okhttp3.Protocol
 import java.io.IOException
 import java.util.concurrent.CompletableFuture
+import java.util.concurrent.LinkedBlockingQueue
+import java.util.concurrent.ThreadPoolExecutor
 
 
 // Advice: always treat time as a Duration
@@ -45,17 +47,25 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val retryAfterMillis: Long = 1000
 
-    private val client = OkHttpClient.Builder()
-        .readTimeout(Duration.ofMillis(1500))
-        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-        .dispatcher(
-            okhttp3.Dispatcher().apply {
-                maxRequests = 10000
-                maxRequestsPerHost = 10000
-            }
-        )
-        .connectionPool(ConnectionPool(10000, 5, TimeUnit.MINUTES))
-        .build()
+   private val client = OkHttpClient.Builder()
+            .readTimeout(Duration.ofMillis(1500))
+            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+            .dispatcher(
+                okhttp3.Dispatcher(
+                    ThreadPoolExecutor(
+                        10000,
+                        10000,
+                        60L,
+                        TimeUnit.SECONDS,
+                        LinkedBlockingQueue()
+                    )
+                ).apply {
+                    maxRequests = 10000
+                    maxRequestsPerHost = 10000
+                }
+            )
+            .connectionPool(ConnectionPool(10000, 5, TimeUnit.MINUTES))
+            .build()
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)

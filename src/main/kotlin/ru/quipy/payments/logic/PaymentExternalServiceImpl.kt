@@ -46,7 +46,7 @@ class PaymentExternalSystemAdapterImpl(
     private val retryAfterMillis: Long = 1000
 
     private val client = OkHttpClient.Builder()
-        .callTimeout(Duration.ofMillis(15000))
+        .readTimeout(Duration.ofMillis(1500))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .dispatcher(
             okhttp3.Dispatcher().apply {

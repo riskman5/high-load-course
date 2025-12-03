@@ -46,15 +46,15 @@ class PaymentExternalSystemAdapterImpl(
     private val retryAfterMillis: Long = 1000
 
     private val client = OkHttpClient.Builder()
-        .readTimeout(Duration.ofMillis(1500))
+        .callTimeout(Duration.ofMillis(15000))
         .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
         .dispatcher(
             okhttp3.Dispatcher().apply {
-                maxRequests = 5000
-                maxRequestsPerHost = 5000
+                maxRequests = 10000
+                maxRequestsPerHost = 10000
             }
         )
-        .connectionPool(ConnectionPool(5000, 5, TimeUnit.MINUTES))
+        .connectionPool(ConnectionPool(10000, 5, TimeUnit.MINUTES))
         .build()
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))

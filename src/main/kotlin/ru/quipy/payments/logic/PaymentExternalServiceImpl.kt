@@ -4,27 +4,20 @@ import com.fasterxml.jackson.databind.ObjectMapper
 import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
-import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.RequestBody
+import io.micrometer.core.instrument.Timer
+import okhttp3.*
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.io.IOException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.TimeUnit
-import io.micrometer.core.instrument.Timer
-import okhttp3.ConnectionPool
-import okhttp3.Protocol
-import java.io.IOException
 import java.util.concurrent.CompletableFuture
-import java.util.concurrent.LinkedBlockingQueue
-import java.util.concurrent.ThreadPoolExecutor
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
-
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>,
@@ -35,7 +28,6 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
     }
@@ -47,63 +39,61 @@ class PaymentExternalSystemAdapterImpl(
     private val parallelRequests = properties.parallelRequests
     private val retryAfterMillis: Long = 1000
 
-   private val client = OkHttpClient.Builder()
-            .readTimeout(Duration.ofMillis(1500))
-            .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
-            .dispatcher(
-                okhttp3.Dispatcher(
-                    ThreadPoolExecutor(
-                        10000,
-                        10000,
-                        60L,
-                        TimeUnit.SECONDS,
-                        LinkedBlockingQueue()
-                    )
-                ).apply {
-                    maxRequests = 10000
-                    maxRequestsPerHost = 10000
-                }
-            )
-            .connectionPool(ConnectionPool(10000, 5, TimeUnit.MINUTES))
-            .build()
-    private val slidingWindowRateLimiter =
-        SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
+    private val client = OkHttpClient.Builder()
+        .readTimeout(Duration.ofMillis(1500))
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .dispatcher(
+            Dispatcher(Executors.newVirtualThreadPerTaskExecutor()).apply {
+                maxRequests = Int.MAX_VALUE
+                maxRequestsPerHost = Int.MAX_VALUE
+            }
+        )
+        .connectionPool(ConnectionPool(10000, 5, TimeUnit.MINUTES))
+        .build()
+
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
     private val ongoingWindow = OngoingWindow(parallelRequests)
+
     private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
-        .description("Количество завершенных входящих запросов")
-        .tags("account", properties.accountName)
+        .tags("account", accountName)
         .register(meterRegistry)
+
     private val incomingFinishedRequestsCounter: Counter = Counter
         .builder("incoming.finished.requests")
-        .description("Количество завершенных входящих запросов")
-        .tags("account", properties.accountName)
+        .tags("account", accountName)
         .register(meterRegistry)
+
     private val outgoingRequestsCounter: Counter = Counter
         .builder("outgoing.requests")
-        .description("Количество исходящих запросов")
-        .tags("account", properties.accountName)
+        .tags("account", accountName)
         .register(meterRegistry)
+
     private val outgoingFinishedRequestsCounter: Counter = Counter
         .builder("outgoing.finished.requests")
-        .description("Количество завершенных исходящих запросов")
-        .tags("account", properties.accountName)
+        .tags("account", accountName)
         .register(meterRegistry)
-    private val clientReqeustLatency: Timer =
-        Timer.builder("client.request.latency")
-            .description("Request latency.")
-            .publishPercentiles(0.5, 0.8, 0.9)
-            .register(meterRegistry)
 
+    private val clientRequestLatency: Timer = Timer
+        .builder("client.request.latency")
+        .publishPercentiles(0.5, 0.8, 0.9)
+        .register(meterRegistry)
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Void> {
+    private val retryExecutor = Executors.newVirtualThreadPerTaskExecutor()
+
+    override fun performPaymentAsync(
+        paymentId: UUID,
+        amount: Int,
+        paymentStartedAt: Long,
+        deadline: Long
+    ): CompletableFuture<Void> {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         incomingRequestsCounter.increment()
 
         paymentESService.update(paymentId) {
-            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
         return makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, 0)
@@ -118,47 +108,87 @@ class PaymentExternalSystemAdapterImpl(
     ): CompletableFuture<Void> {
         val future = CompletableFuture<Void>()
 
-        if (deadline - System.currentTimeMillis() < requestAverageProcessingTime.toMillis() || attempt >= 3) {
+        if (deadline - now() < requestAverageProcessingTime.toMillis() || attempt >= 3) {
             incomingFinishedRequestsCounter.increment()
             future.complete(null)
             return future
         }
 
-        ongoingWindow.acquire(deadline - now() - requestAverageProcessingTime.toMillis(),
-            TimeUnit.MILLISECONDS)
-        slidingWindowRateLimiter.tickBlocking(
-            deadline - now() - requestAverageProcessingTime.toMillis(),
-            TimeUnit.MILLISECONDS
-        )
+        if (!ongoingWindow.acquire(
+                deadline - now() - requestAverageProcessingTime.toMillis(),
+                TimeUnit.MILLISECONDS
+            )
+        ) {
+            logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Timeout - ongoingWindow")
+            }
+            incomingFinishedRequestsCounter.increment()
+            future.complete(null)
+            return future
+        }
 
+        if (!slidingWindowRateLimiter.tickBlocking(
+                deadline - now() - requestAverageProcessingTime.toMillis(),
+                TimeUnit.MILLISECONDS
+            )
+        ) {
+            logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
+            }
+            ongoingWindow.release()
+            incomingFinishedRequestsCounter.increment()
+            future.complete(null)
+            return future
+        }
+
+        val clientRequestStart = now()
         outgoingRequestsCounter.increment()
 
-        val request = Request.Builder().run {
-            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-            post(emptyBody)
-        }.build()
+        val request = Request.Builder()
+            .url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            .post(emptyBody)
+            .build()
 
-        client.newCall(request).enqueue(object : okhttp3.Callback {
-            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+        client.newCall(request).enqueue(object : Callback {
+            override fun onResponse(call: Call, response: Response) {
+                val clientRequestFinish = now()
+                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+
                 try {
                     response.use {
                         val body = try {
                             mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                         } catch (e: Exception) {
+                            logger.error("[$accountName] Failed to parse response for txId: $transactionId", e)
                             ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                         }
 
+                        logger.info("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}")
+
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        }
+
                         if (body.result) {
-                            paymentESService.update(paymentId) {
-                                it.logProcessing(true, now(), transactionId, reason = body.message)
-                            }
+                            outgoingFinishedRequestsCounter.increment()
+                            incomingFinishedRequestsCounter.increment()
                             future.complete(null)
                         } else if (attempt < 2) {
-                            CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS).execute {
+                            // Используем Virtual Thread для задержки перед ретраем
+                            retryExecutor.submit {
+                                Thread.sleep(retryAfterMillis)
                                 makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                                    .whenComplete { _, _ -> future.complete(null) }
+                                    .whenComplete { _, _ ->
+                                        outgoingFinishedRequestsCounter.increment()
+                                        incomingFinishedRequestsCounter.increment()
+                                        future.complete(null)
+                                    }
                             }
                         } else {
+                            outgoingFinishedRequestsCounter.increment()
+                            incomingFinishedRequestsCounter.increment()
                             future.complete(null)
                         }
                     }
@@ -167,15 +197,30 @@ class PaymentExternalSystemAdapterImpl(
                 }
             }
 
-            override fun onFailure(call: okhttp3.Call, e: IOException) {
+            override fun onFailure(call: Call, e: IOException) {
+                val clientRequestFinish = now()
+                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+
                 try {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+
                     paymentESService.update(paymentId) {
                         it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
+
                     if (attempt < 2) {
-                        makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                            .whenComplete { _, _ -> future.complete(null) }
+                        retryExecutor.submit {
+                            Thread.sleep(retryAfterMillis)
+                            makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                                .whenComplete { _, _ ->
+                                    outgoingFinishedRequestsCounter.increment()
+                                    incomingFinishedRequestsCounter.increment()
+                                    future.complete(null)
+                                }
+                        }
                     } else {
+                        outgoingFinishedRequestsCounter.increment()
+                        incomingFinishedRequestsCounter.increment()
                         future.complete(null)
                     }
                 } finally {
@@ -188,14 +233,9 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
-    override fun rateLimitPerSec(): Int {
-        return properties.rateLimitPerSec
-    }
-
+    override fun rateLimitPerSec() = properties.rateLimitPerSec
     override fun name() = properties.accountName
 }
 
-public fun now() = System.currentTimeMillis()
+fun now() = System.currentTimeMillis()

@@ -17,6 +17,9 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
 import io.micrometer.core.instrument.Timer
+import okhttp3.ConnectionPool
+import okhttp3.Protocol
+import java.util.concurrent.CompletableFuture
 
 
 // Advice: always treat time as a Duration
@@ -44,6 +47,8 @@ class PaymentExternalSystemAdapterImpl(
 
     private val client = OkHttpClient.Builder()
         .readTimeout(Duration.ofMillis(1500))
+        .protocols(listOf(Protocol.HTTP_2, Protocol.HTTP_1_1))
+        .connectionPool(ConnectionPool(5000, 5, TimeUnit.MINUTES))
         .build()
     private val slidingWindowRateLimiter =
         SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -75,111 +80,77 @@ class PaymentExternalSystemAdapterImpl(
             .register(meterRegistry)
 
 
-    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+    override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long): CompletableFuture<Void> {
         logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         incomingRequestsCounter.increment()
-        // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-        // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+
         paymentESService.update(paymentId) {
             it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        logger.info("[$accountName] Submit: $paymentId , txId: $transactionId")
+        return makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, 0)
+    }
 
-        var attempt = 0
-        var success = false
+    private fun makeAsyncRequestWithRetries(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long,
+        attempt: Int
+    ): CompletableFuture<Void> {
+        val future = CompletableFuture<Void>()
 
-        while ((deadline - System.currentTimeMillis() >= 0) &&
-            attempt < 3 && !success
-        ) {
-            val clientRequestStart = System.currentTimeMillis()
+        if (deadline - System.currentTimeMillis() < 0 || attempt >= 3) {
+            future.complete(null)
+            return future
+        }
 
-            try {
-                if (!ongoingWindow.acquire(
-                        deadline - now() - requestAverageProcessingTime.toMillis(),
-                        TimeUnit.MILLISECONDS
-                    )
-                ) {
-                    logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId)
-                    }
+        val request = Request.Builder().run {
+            url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
+            post(emptyBody)
+        }.build()
 
-                    incomingFinishedRequestsCounter.increment()
-                    return
-                }
-                if (!slidingWindowRateLimiter.tickBlocking(
-                        deadline - now() - requestAverageProcessingTime.toMillis(),
-                        TimeUnit.MILLISECONDS
-                    )
-                ) {
-                    logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId)
-                    }
-
-                    incomingFinishedRequestsCounter.increment()
-                    return
-                }
-
-                outgoingRequestsCounter.increment()
-
-                val request = Request.Builder().run {
-                    url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                    post(emptyBody)
-                }.build()
-
-
-                client.newCall(request).execute().use { response ->
+        client.newCall(request).enqueue(object : okhttp3.Callback {
+            override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
+                response.use {
                     val body = try {
                         mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
                         ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
                     }
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
-                    }
                     if (body.result) {
-                        success = true
-                    } else if (attempt == 0) {
-                        Thread.sleep(retryAfterMillis)
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(true, now(), transactionId, reason = body.message)
+                        }
+                        future.complete(null)
+                    } else if (attempt < 2) {
+                        CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS).execute {
+                            makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                                .whenComplete { _, _ -> future.complete(null) }
+                        }
+                    } else {
+                        future.complete(null)
                     }
                 }
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                        }
-                    }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
-                    }
-                }
-                attempt++
-            } finally {
-                val clientRequestFinish = System.currentTimeMillis()
-
-                clientReqeustLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
-                ongoingWindow.release()
-                incomingFinishedRequestsCounter.increment()
-                outgoingFinishedRequestsCounter.increment()
             }
-        }
+
+            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                }
+                if (attempt < 2) {
+                    makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                        .whenComplete { _, _ -> future.complete(null) }
+                } else {
+                    future.complete(null)
+                }
+            }
+        })
+
+        return future
     }
 
     override fun price() = properties.price

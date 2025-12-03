@@ -12,13 +12,13 @@ import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
-import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
 import java.util.concurrent.TimeUnit
 import io.micrometer.core.instrument.Timer
 import okhttp3.ConnectionPool
 import okhttp3.Protocol
+import java.io.IOException
 import java.util.concurrent.CompletableFuture
 
 
@@ -102,10 +102,20 @@ class PaymentExternalSystemAdapterImpl(
     ): CompletableFuture<Void> {
         val future = CompletableFuture<Void>()
 
-        if (deadline - System.currentTimeMillis() < 0 || attempt >= 3) {
+        if (deadline - System.currentTimeMillis() < requestAverageProcessingTime.toMillis() || attempt >= 3) {
+            incomingFinishedRequestsCounter.increment()
             future.complete(null)
             return future
         }
+
+        ongoingWindow.acquire(deadline - now() - requestAverageProcessingTime.toMillis(),
+            TimeUnit.MILLISECONDS)
+        slidingWindowRateLimiter.tickBlocking(
+            deadline - now() - requestAverageProcessingTime.toMillis(),
+            TimeUnit.MILLISECONDS
+        )
+
+        outgoingRequestsCounter.increment()
 
         val request = Request.Builder().run {
             url("http://$paymentProviderHostPort/external/process?serviceName=$serviceName&token=$token&accountName=$accountName&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
@@ -114,38 +124,46 @@ class PaymentExternalSystemAdapterImpl(
 
         client.newCall(request).enqueue(object : okhttp3.Callback {
             override fun onResponse(call: okhttp3.Call, response: okhttp3.Response) {
-                response.use {
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+                try {
+                    response.use {
+                        val body = try {
+                            mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                        } catch (e: Exception) {
+                            ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        }
 
-                    if (body.result) {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(true, now(), transactionId, reason = body.message)
+                        if (body.result) {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(true, now(), transactionId, reason = body.message)
+                            }
+                            future.complete(null)
+                        } else if (attempt < 2) {
+                            CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS).execute {
+                                makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                                    .whenComplete { _, _ -> future.complete(null) }
+                            }
+                        } else {
+                            future.complete(null)
                         }
-                        future.complete(null)
-                    } else if (attempt < 2) {
-                        CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS).execute {
-                            makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                                .whenComplete { _, _ -> future.complete(null) }
-                        }
-                    } else {
-                        future.complete(null)
                     }
+                } finally {
+                    ongoingWindow.release()
                 }
             }
 
-            override fun onFailure(call: okhttp3.Call, e: java.io.IOException) {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                }
-                if (attempt < 2) {
-                    makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                        .whenComplete { _, _ -> future.complete(null) }
-                } else {
-                    future.complete(null)
+            override fun onFailure(call: okhttp3.Call, e: IOException) {
+                try {
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
+                    }
+                    if (attempt < 2) {
+                        makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                            .whenComplete { _, _ -> future.complete(null) }
+                    } else {
+                        future.complete(null)
+                    }
+                } finally {
+                    ongoingWindow.release()
                 }
             }
         })

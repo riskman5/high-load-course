@@ -19,6 +19,7 @@ import java.util.*
 import java.util.concurrent.CompletableFuture
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.compareTo
 
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
@@ -43,7 +44,7 @@ class PaymentExternalSystemAdapterImpl(
     private val client: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofMillis(1500))
         .version(HttpClient.Version.HTTP_2)
-        .executor(Executors.newFixedThreadPool(10000))
+        .executor(Executors.newVirtualThreadPerTaskExecutor())
         .build()
 
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
@@ -74,7 +75,6 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.5, 0.8, 0.9)
         .register(meterRegistry)
 
-    private val retryExecutor = Executors.newVirtualThreadPerTaskExecutor()
     private val updateExecutor = Executors.newVirtualThreadPerTaskExecutor()
 
     override fun performPaymentAsync(
@@ -121,7 +121,8 @@ class PaymentExternalSystemAdapterImpl(
 
             updateExecutor.submit {
                 paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Timeout - ongoingWindow")                }
+                    it.logProcessing(false, now(), transactionId, reason = "Timeout - ongoingWindow")
+                }
             }
 
             incomingFinishedRequestsCounter.increment()
@@ -135,12 +136,15 @@ class PaymentExternalSystemAdapterImpl(
             )
         ) {
             logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
+
+            ongoingWindow.release()
+
             updateExecutor.submit {
                 paymentESService.update(paymentId) {
                     it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
                 }
             }
-            ongoingWindow.release()
+
             incomingFinishedRequestsCounter.increment()
             future.complete(null)
             return future
@@ -183,18 +187,12 @@ class PaymentExternalSystemAdapterImpl(
                     }
 
                     if (attempt < 2) {
-                        retryExecutor.submit {
-                            Thread.sleep(retryAfterMillis)
-                            makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                                .whenComplete { _, _ ->
-                                    outgoingFinishedRequestsCounter.increment()
-                                    incomingFinishedRequestsCounter.increment()
-                                    future.complete(null)
-                                }
-                        }
+                        CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS)
+                            .execute {
+                                makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                                    .whenComplete { _, _ -> future.complete(null) }
+                            }
                     } else {
-                        outgoingFinishedRequestsCounter.increment()
-                        incomingFinishedRequestsCounter.increment()
                         future.complete(null)
                     }
                 } else {
@@ -202,12 +200,19 @@ class PaymentExternalSystemAdapterImpl(
                         mapper.readValue(response.body(), ExternalSysResponse::class.java)
                     } catch (e: Exception) {
                         logger.error("[$accountName] Failed to parse response for txId: $transactionId", e)
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                        updateExecutor.submit {
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Parse error: ${e.message}")
+                            }
+                        }
+                        future.complete(null)
+                        null
                     }
 
-                    logger.info(
-                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}"
-                    )
+                    body?.let {
+                        logger.info(
+                            "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${it.result}"
+                        )
 
                     updateExecutor.submit {
                         paymentESService.update(paymentId) {
@@ -215,26 +220,22 @@ class PaymentExternalSystemAdapterImpl(
                         }
                     }
 
-                    if (body.result) {
-                        outgoingFinishedRequestsCounter.increment()
-                        incomingFinishedRequestsCounter.increment()
-                        future.complete(null)
-                    } else if (attempt < 2) {
-                        retryExecutor.submit {
-                            Thread.sleep(retryAfterMillis)
-                            makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
-                                .whenComplete { _, _ ->
-                                    outgoingFinishedRequestsCounter.increment()
-                                    incomingFinishedRequestsCounter.increment()
-                                    future.complete(null)
+                        if (it.result) {
+                            future.complete(null)
+                        } else if (attempt < 2) {
+                            CompletableFuture.delayedExecutor(retryAfterMillis, TimeUnit.MILLISECONDS)
+                                .execute {
+                                    makeAsyncRequestWithRetries(paymentId, amount, transactionId, deadline, attempt + 1)
+                                        .whenComplete { _, _ -> future.complete(null) }
                                 }
+                        } else {
+                            future.complete(null)
                         }
-                    } else {
-                        outgoingFinishedRequestsCounter.increment()
-                        incomingFinishedRequestsCounter.increment()
-                        future.complete(null)
                     }
                 }
+
+                outgoingFinishedRequestsCounter.increment()
+                incomingFinishedRequestsCounter.increment()
             }
 
         return future

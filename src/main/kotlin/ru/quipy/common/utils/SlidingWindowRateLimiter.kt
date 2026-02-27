@@ -48,6 +48,22 @@ class SlidingWindowRateLimiter(
 
         return true
     }
+
+    suspend fun tickSuspend(timeout: Long, unit: TimeUnit): Boolean {
+        if (timeout <= 0) return false
+        val start = now()
+        val timeoutMillis = unit.toMillis(timeout)
+
+        while (!tick()) {
+            delay(10)
+
+            if (now() > start + timeoutMillis) {
+                return false
+            }
+        }
+
+        return true
+    }
     data class Measure(
         val value: Long,
         val timestamp: Long

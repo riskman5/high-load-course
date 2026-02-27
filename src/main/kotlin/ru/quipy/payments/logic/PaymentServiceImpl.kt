@@ -1,9 +1,10 @@
 package ru.quipy.payments.logic
 
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.util.*
-import java.util.concurrent.CompletableFuture
 
 
 @Service
@@ -14,11 +15,13 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) : CompletableFuture<Void> {
-        val futures = paymentAccounts.map { account ->
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
+    override suspend fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        coroutineScope {
+            paymentAccounts.forEach { account ->
+                launch {
+                    account.performPayment(paymentId, amount, paymentStartedAt, deadline)
+                }
+            }
         }
-
-        return CompletableFuture.allOf(*futures.toTypedArray())
     }
 }

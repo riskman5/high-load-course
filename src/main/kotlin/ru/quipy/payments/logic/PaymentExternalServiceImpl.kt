@@ -10,7 +10,9 @@ import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -21,6 +23,7 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
@@ -37,11 +40,11 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
-        const val MAX_ATTEMPTS = 3
-        const val RETRY_BASE_MS = 10L
-        const val RETRY_MAX_MS = 100L
-        const val MIN_DEADLINE_BUDGET_MS = 30L
-        const val REQUEST_TIMEOUT_MS = 1500L
+        const val MAX_ATTEMPTS = 4
+        const val RETRY_BASE_MS = 30L
+        const val RETRY_MAX_MS = 500L
+        const val MIN_DEADLINE_BUDGET_MS = 50L
+        const val REQUEST_TIMEOUT_MS = 2000L
     }
 
     private val serviceName = properties.serviceName
@@ -61,8 +64,10 @@ class PaymentExternalSystemAdapterImpl(
         Duration.ofSeconds(1)
     )
 
-    private val dbExecutor = Executors.newFixedThreadPool(32)
-    private val dbScope = CoroutineScope(dbExecutor.asCoroutineDispatcher())
+    private val dbExecutor = Executors.newFixedThreadPool(16)
+    private val updateScope = CoroutineScope(dbExecutor.asCoroutineDispatcher())
+
+    private val paymentMutexes = ConcurrentHashMap<UUID, Mutex>()
 
     private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
@@ -94,19 +99,23 @@ class PaymentExternalSystemAdapterImpl(
         .tags("account", accountName)
         .register(meterRegistry)
 
-    private fun fireAndForgetUpdate(paymentId: UUID, block: (PaymentAggregateState) -> ru.quipy.domain.Event<PaymentAggregate>) {
-        dbScope.launch {
-            repeat(5) { attempt ->
-                try {
-                    paymentESService.update(paymentId) { block(it) }
-                    return@launch
-                } catch (_: IllegalArgumentException) {
-                    delay(10)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] DB update failed for payment: $paymentId", e)
-                    return@launch
+    private fun safeUpdate(paymentId: UUID, block: (PaymentAggregateState) -> ru.quipy.domain.Event<PaymentAggregate>) {
+        updateScope.launch {
+            val mutex = paymentMutexes.getOrPut(paymentId) { Mutex() }
+            mutex.withLock {
+                while (true) {
+                    try {
+                        paymentESService.update(paymentId) { block(it) }
+                        break
+                    } catch (_: IllegalArgumentException) {
+                        delay(10)
+                    } catch (e: Exception) {
+                        logger.error("[$accountName] DB update failed for payment: $paymentId", e)
+                        break
+                    }
                 }
             }
+            paymentMutexes.remove(paymentId)
         }
     }
 
@@ -128,13 +137,13 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         incomingRequestsCounter.increment()
 
-        fireAndForgetUpdate(paymentId) {
+        safeUpdate(paymentId) {
             it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
         val result = performRequestWithRetry(paymentId, amount, transactionId, deadline, 1)
 
-        fireAndForgetUpdate(paymentId) {
+        safeUpdate(paymentId) {
             it.logProcessing(result.success, now(), transactionId, reason = result.message)
         }
         incomingFinishedRequestsCounter.increment()

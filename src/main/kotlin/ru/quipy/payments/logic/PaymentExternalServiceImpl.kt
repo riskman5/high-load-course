@@ -6,14 +6,15 @@ import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.IO
+import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -24,6 +25,8 @@ import java.net.http.HttpRequest
 import java.net.http.HttpResponse
 import java.time.Duration
 import java.util.*
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 class PaymentExternalSystemAdapterImpl(
@@ -58,7 +61,10 @@ class PaymentExternalSystemAdapterImpl(
         Duration.ofSeconds(1)
     )
 
-    private val updateScope = CoroutineScope(Dispatchers.IO)
+    private val dbExecutor = Executors.newFixedThreadPool(8)
+    private val updateScope = CoroutineScope(dbExecutor.asCoroutineDispatcher())
+
+    private val paymentMutexes = ConcurrentHashMap<UUID, Mutex>()
 
     private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
@@ -85,6 +91,26 @@ class PaymentExternalSystemAdapterImpl(
         .publishPercentiles(0.5, 0.8, 0.9)
         .register(meterRegistry)
 
+    private fun safeUpdate(paymentId: UUID, block: (PaymentAggregateState) -> ru.quipy.domain.Event<PaymentAggregate>) {
+        updateScope.launch {
+            val mutex = paymentMutexes.getOrPut(paymentId) { Mutex() }
+            mutex.withLock {
+                repeat(3) { attempt ->
+                    try {
+                        paymentESService.update(paymentId) { block(it) }
+                        return@withLock
+                    } catch (e: Exception) {
+                        if (attempt == 2) {
+                            logger.error("[$accountName] DB update failed after 3 attempts for payment: $paymentId", e)
+                        } else {
+                            delay(50L * (attempt + 1))
+                        }
+                    }
+                }
+            }
+        }
+    }
+
 
     override suspend fun performPayment(
         paymentId: UUID,
@@ -97,10 +123,8 @@ class PaymentExternalSystemAdapterImpl(
         val transactionId = UUID.randomUUID()
         incomingRequestsCounter.increment()
 
-        updateScope.launch {
-            paymentESService.update(paymentId) {
-                it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
-            }
+        safeUpdate(paymentId) {
+            it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
         performHedgedPayment(paymentId, amount, transactionId, deadline)
@@ -123,10 +147,8 @@ class PaymentExternalSystemAdapterImpl(
             )
         ) {
             logger.error("[$accountName] Payment timeout (rate limiter) for txId: $transactionId, payment: $paymentId")
-            updateScope.launch {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
-                }
+            safeUpdate(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
             }
             incomingFinishedRequestsCounter.increment()
             return
@@ -173,16 +195,12 @@ class PaymentExternalSystemAdapterImpl(
                     logger.info(
                         "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${result.result}"
                     )
-                    updateScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(result.result, now(), transactionId, reason = result.message)
-                        }
+                    safeUpdate(paymentId) {
+                        it.logProcessing(result.result, now(), transactionId, reason = result.message)
                     }
                 } else {
-                    updateScope.launch {
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "No response from hedged requests")
-                        }
+                    safeUpdate(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = "No response from hedged requests")
                     }
                 }
 
@@ -190,10 +208,8 @@ class PaymentExternalSystemAdapterImpl(
             }
         } catch (e: Exception) {
             logger.error("[$accountName] Hedged payment failed for txId: $transactionId, payment: $paymentId", e)
-            updateScope.launch {
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = e.message)
-                }
+            safeUpdate(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = e.message)
             }
             incomingFinishedRequestsCounter.increment()
         }

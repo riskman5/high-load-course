@@ -44,11 +44,11 @@ class PaymentExternalSystemAdapterImpl(
         const val RETRY_BASE_MS = 30L
         const val RETRY_MAX_MS = 500L
         const val MIN_DEADLINE_BUDGET_MS = 50L
+        const val REQUEST_TIMEOUT_MS = 2000L
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
-    private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
     private val parallelRequests = properties.parallelRequests
 
@@ -192,7 +192,7 @@ class PaymentExternalSystemAdapterImpl(
         concurrencySemaphore.acquire()
         try {
             val timeoutMs = remainingMillis(deadline)
-                .coerceAtMost(requestAverageProcessingTime.toMillis() * 3)
+                .coerceAtMost(REQUEST_TIMEOUT_MS)
                 .coerceAtLeast(1L)
 
             val uri = "http://$paymentProviderHostPort/external/process" +

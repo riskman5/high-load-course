@@ -1,95 +1,64 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 import org.slf4j.Logger
 import org.slf4j.LoggerFactory
-import ru.quipy.payments.logic.now
 import java.time.Duration
-import java.util.concurrent.Executors
-import java.util.concurrent.PriorityBlockingQueue
+import java.util.ArrayDeque
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 
 class SlidingWindowRateLimiter(
     private val rate: Long,
     private val window: Duration,
 ) : RateLimiter {
-    private val rateLimiterScope = CoroutineScope(Executors.newSingleThreadExecutor().asCoroutineDispatcher())
+    companion object {
+        private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
+    }
 
-    private val sum = AtomicLong(0)
-    private val queue = PriorityBlockingQueue<Measure>(10_000)
+    private val windowMs = window.toMillis()
+    private val timestamps = ArrayDeque<Long>()
+    private val lock = ReentrantLock()
 
     override fun tick(): Boolean {
-        while (true) {
-            val curSum = sum.get()
-            if (curSum >= rate) return false
-            if (sum.compareAndSet(curSum, curSum + 1)) {
-                queue.add(Measure(1, System.currentTimeMillis()))
-                return true
+        if (rate <= 0L) return false
+        return lock.withLock {
+            val now = System.currentTimeMillis()
+            cleanup(now)
+            if (timestamps.size < rate.toInt()) {
+                timestamps.addLast(now)
+                true
+            } else {
+                false
             }
         }
     }
 
     fun tickBlocking(timeout: Long, unit: TimeUnit): Boolean {
         if (timeout <= 0) return false
-        val start = now()
-        val timeoutMillis = unit.toMillis(timeout)
-
-        while (!tick()) {
-            Thread.sleep(10)
-
-            if (now() > start + timeoutMillis) {
-                return false
-            }
+        val deadline = System.currentTimeMillis() + unit.toMillis(timeout)
+        while (System.currentTimeMillis() < deadline) {
+            if (tick()) return true
+            Thread.sleep(1)
         }
-
-        return true
+        return false
     }
 
     suspend fun tickSuspend(timeout: Long, unit: TimeUnit): Boolean {
         if (timeout <= 0) return false
-        val start = now()
-        val timeoutMillis = unit.toMillis(timeout)
-
-        while (!tick()) {
-            delay(10)
-
-            if (now() > start + timeoutMillis) {
-                return false
-            }
+        val deadline = System.currentTimeMillis() + unit.toMillis(timeout)
+        while (System.currentTimeMillis() < deadline) {
+            if (tick()) return true
+            delay(1)
         }
-
-        return true
-    }
-    data class Measure(
-        val value: Long,
-        val timestamp: Long
-    ) : Comparable<Measure> {
-        override fun compareTo(other: Measure): Int {
-            return timestamp.compareTo(other.timestamp)
-        }
+        return false
     }
 
-    private val releaseJob = rateLimiterScope.launch {
-        while (true) {
-            val head = queue.peek()
-            val winStart = System.currentTimeMillis() - window.toMillis()
-            if (head == null) {
-                delay(1L)
-                continue
-            }
-            if (head.timestamp > winStart) {
-                delay(head.timestamp - winStart)
-                continue
-            }
-            sum.addAndGet(-1)
-            queue.take()
+    private fun cleanup(now: Long) {
+        val windowStart = now - windowMs
+        while (timestamps.isNotEmpty() && timestamps.first() <= windowStart) {
+            timestamps.removeFirst()
         }
-    }.invokeOnCompletion { th -> if (th != null) logger.error("Rate limiter release job completed", th) }
-    companion object {
-        private val logger: Logger = LoggerFactory.getLogger(SlidingWindowRateLimiter::class.java)
     }
 }

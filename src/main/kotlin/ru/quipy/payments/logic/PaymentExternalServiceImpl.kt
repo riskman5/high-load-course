@@ -8,11 +8,13 @@ import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.selects.select
 import org.slf4j.LoggerFactory
-import ru.quipy.common.utils.OngoingWindow
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
@@ -35,22 +37,26 @@ class PaymentExternalSystemAdapterImpl(
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val mapper = ObjectMapper().registerKotlinModule()
+
+        const val HEDGE_DELAY_FRACTION = 0.7
     }
 
     private val serviceName = properties.serviceName
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
-    private val parallelRequests = properties.parallelRequests
-    private val retryAfterMillis: Long = 50
+
+    private val hedgeDelayMs = (requestAverageProcessingTime.toMillis() * HEDGE_DELAY_FRACTION).toLong()
 
     private val client: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofMillis(1500))
         .version(HttpClient.Version.HTTP_2)
         .build()
 
-    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(rateLimitPerSec.toLong(), Duration.ofSeconds(1))
-    private val ongoingWindow = OngoingWindow(parallelRequests)
+    private val slidingWindowRateLimiter = SlidingWindowRateLimiter(
+        (rateLimitPerSec * 0.95).toLong().coerceAtLeast(1),
+        Duration.ofSeconds(1)
+    )
 
     private val updateScope = CoroutineScope(Dispatchers.IO)
 
@@ -97,145 +103,152 @@ class PaymentExternalSystemAdapterImpl(
             }
         }
 
-        makeRequestWithRetries(paymentId, amount, transactionId, deadline)
+        performHedgedPayment(paymentId, amount, transactionId, deadline)
     }
 
-    private suspend fun makeRequestWithRetries(
+    private suspend fun performHedgedPayment(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,
         deadline: Long
     ) {
-        for (attempt in 0 until 3) {
-            if (deadline - now() < requestAverageProcessingTime.toMillis()) {
-                incomingFinishedRequestsCounter.increment()
-                return
+        if (remainingMillis(deadline) < requestAverageProcessingTime.toMillis()) {
+            incomingFinishedRequestsCounter.increment()
+            return
+        }
+
+        if (!slidingWindowRateLimiter.tickSuspend(
+                remainingMillis(deadline) - requestAverageProcessingTime.toMillis(),
+                TimeUnit.MILLISECONDS
+            )
+        ) {
+            logger.error("[$accountName] Payment timeout (rate limiter) for txId: $transactionId, payment: $paymentId")
+            updateScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
+                }
             }
+            incomingFinishedRequestsCounter.increment()
+            return
+        }
 
-            if (!ongoingWindow.acquireSuspend(
-                    deadline - now() - requestAverageProcessingTime.toMillis(),
-                    TimeUnit.MILLISECONDS
-                )
-            ) {
-                logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
-
-                updateScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Timeout - ongoingWindow")
-                    }
+        try {
+            coroutineScope {
+                val firstRequest = async {
+                    sendPaymentRequest(paymentId, amount, transactionId, deadline)
                 }
 
-                incomingFinishedRequestsCounter.increment()
-                return
-            }
-
-            if (!slidingWindowRateLimiter.tickSuspend(
-                    deadline - now() - requestAverageProcessingTime.toMillis(),
-                    TimeUnit.MILLISECONDS
-                )
-            ) {
-                logger.error("[$accountName] Payment timeout on our side for txId: $transactionId, payment: $paymentId")
-
-                ongoingWindow.release()
-
-                updateScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Timeout - rateLimiter")
+                val hedgeRequest = async {
+                    delay(hedgeDelayMs)
+                    if (firstRequest.isCompleted) {
+                        return@async null
                     }
+
+                    if (remainingMillis(deadline) < requestAverageProcessingTime.toMillis()) {
+                        return@async null
+                    }
+
+                    if (!slidingWindowRateLimiter.tickSuspend(
+                            (remainingMillis(deadline) - requestAverageProcessingTime.toMillis())
+                                .coerceAtLeast(1),
+                            TimeUnit.MILLISECONDS
+                        )
+                    ) {
+                        return@async null
+                    }
+
+                    logger.info("[$accountName] Hedged request triggered for txId: $transactionId, payment: $paymentId")
+                    sendPaymentRequest(paymentId, amount, transactionId, deadline)
                 }
 
-                incomingFinishedRequestsCounter.increment()
-                return
-            }
+                val result: ExternalSysResponse? = select {
+                    firstRequest.onAwait { it }
+                    hedgeRequest.onAwait { it }
+                }
 
-            val clientRequestStart = now()
-            outgoingRequestsCounter.increment()
+                firstRequest.cancel()
+                hedgeRequest.cancel()
 
-            val uri = "http://$paymentProviderHostPort/external/process" +
-                    "?serviceName=$serviceName" +
-                    "&token=$token" +
-                    "&accountName=$accountName" +
-                    "&transactionId=$transactionId" +
-                    "&paymentId=$paymentId" +
-                    "&amount=$amount"
-
-            val request = HttpRequest.newBuilder()
-                .uri(URI.create(uri))
-                .timeout(Duration.ofMillis(requestAverageProcessingTime.toMillis()))
-                .POST(HttpRequest.BodyPublishers.noBody())
-                .build()
-
-            try {
-                val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
-
-                val clientRequestFinish = now()
-                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
-                ongoingWindow.release()
-
-                val body = try {
-                    mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                } catch (e: Exception) {
-                    logger.error("[$accountName] Failed to parse response for txId: $transactionId", e)
+                if (result != null) {
+                    logger.info(
+                        "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${result.result}"
+                    )
                     updateScope.launch {
                         paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Parse error: ${e.message}")
+                            it.logProcessing(result.result, now(), transactionId, reason = result.message)
                         }
                     }
-                    outgoingFinishedRequestsCounter.increment()
-                    incomingFinishedRequestsCounter.increment()
-                    return
-                }
-
-                logger.info(
-                    "[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}"
-                )
-
-                updateScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                } else {
+                    updateScope.launch {
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "No response from hedged requests")
+                        }
                     }
                 }
 
-                outgoingFinishedRequestsCounter.increment()
                 incomingFinishedRequestsCounter.increment()
-
-                if (body.result) {
-                    return
-                }
-
-                if (attempt < 2) {
-                    delay(retryAfterMillis)
-                    continue
-                }
-                return
-
-            } catch (throwable: Exception) {
-                val clientRequestFinish = now()
-                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
-                ongoingWindow.release()
-
-                logger.error(
-                    "[$accountName] Payment failed for txId: $transactionId, payment: $paymentId",
-                    throwable
-                )
-
-                updateScope.launch {
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = throwable.message)
-                    }
-                }
-
-                outgoingFinishedRequestsCounter.increment()
-                incomingFinishedRequestsCounter.increment()
-
-                if (attempt < 2) {
-                    delay(retryAfterMillis)
-                    continue
-                }
-                return
             }
+        } catch (e: Exception) {
+            logger.error("[$accountName] Hedged payment failed for txId: $transactionId, payment: $paymentId", e)
+            updateScope.launch {
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = e.message)
+                }
+            }
+            incomingFinishedRequestsCounter.increment()
         }
     }
+
+    private suspend fun sendPaymentRequest(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long
+    ): ExternalSysResponse? {
+        val timeoutMs = remainingMillis(deadline)
+            .coerceAtMost(requestAverageProcessingTime.toMillis())
+            .coerceAtLeast(1L)
+
+        val uri = "http://$paymentProviderHostPort/external/process" +
+                "?serviceName=$serviceName" +
+                "&token=$token" +
+                "&accountName=$accountName" +
+                "&transactionId=$transactionId" +
+                "&paymentId=$paymentId" +
+                "&amount=$amount"
+
+        val request = HttpRequest.newBuilder()
+            .uri(URI.create(uri))
+            .timeout(Duration.ofMillis(timeoutMs))
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build()
+
+        val clientRequestStart = now()
+        outgoingRequestsCounter.increment()
+
+        return try {
+            val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
+            val clientRequestFinish = now()
+            clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+            outgoingFinishedRequestsCounter.increment()
+
+            try {
+                mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] Failed to parse response for txId: $transactionId", e)
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+        } catch (e: Exception) {
+            val clientRequestFinish = now()
+            clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+            outgoingFinishedRequestsCounter.increment()
+            logger.error("[$accountName] Payment request failed for txId: $transactionId, payment: $paymentId", e)
+            null
+        }
+    }
+
+    private fun remainingMillis(deadline: Long): Long =
+        (deadline - now()).coerceAtLeast(0L)
 
     override fun price() = properties.price
     override fun isEnabled() = properties.enabled

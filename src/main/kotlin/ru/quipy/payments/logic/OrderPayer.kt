@@ -47,10 +47,8 @@ class OrderPayer {
 
         coroutineScope.launch {
             try {
-                launch {
-                    paymentESService.create {
-                        it.create(paymentId, orderId, amount)
-                    }
+                paymentESService.create {
+                    it.create(paymentId, orderId, amount)
                 }
 
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)

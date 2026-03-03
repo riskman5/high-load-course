@@ -35,14 +35,23 @@ class OrderPayer {
     fun processPayment(orderId: UUID, amount: Int, paymentId: UUID, deadline: Long): Long? {
         val createdAt = System.currentTimeMillis()
 
-        backpressureSemaphore.acquire()
+        if (deadline <= createdAt) {
+            logger.warn("Payment $paymentId rejected: deadline already passed")
+            return null
+        }
+
+        if (!backpressureSemaphore.tryAcquire()) {
+            logger.warn("Payment $paymentId rejected: backpressure limit reached")
+            return null
+        }
 
         coroutineScope.launch {
             try {
-                val createdEvent = paymentESService.create {
-                    it.create(paymentId, orderId, amount)
+                launch {
+                    paymentESService.create {
+                        it.create(paymentId, orderId, amount)
+                    }
                 }
-                logger.trace("Payment ${createdEvent.paymentId} for order $orderId created.")
 
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } catch (e: Exception) {

@@ -1,7 +1,5 @@
 package ru.quipy.payments.logic
 
-import kotlinx.coroutines.coroutineScope
-import kotlinx.coroutines.launch
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.util.*
@@ -15,13 +13,16 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
+    private val sortedAccounts = paymentAccounts
+        .filter { it.isEnabled() }
+        .sortedBy { it.price() }
+
     override suspend fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        coroutineScope {
-            paymentAccounts.forEach { account ->
-                launch {
-                    account.performPayment(paymentId, amount, paymentStartedAt, deadline)
-                }
-            }
+        val account = sortedAccounts.firstOrNull()
+        if (account == null) {
+            logger.error("No enabled payment accounts available for payment $paymentId")
+            return
         }
+        account.performPayment(paymentId, amount, paymentStartedAt, deadline)
     }
 }

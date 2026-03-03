@@ -14,6 +14,7 @@ import kotlinx.coroutines.future.await
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
@@ -48,8 +49,11 @@ class PaymentExternalSystemAdapterImpl(
     private val accountName = properties.accountName
     private val requestAverageProcessingTime = properties.averageProcessingTime
     private val rateLimitPerSec = properties.rateLimitPerSec
+    private val parallelRequests = properties.parallelRequests
 
     private val hedgeDelayMs = (requestAverageProcessingTime.toMillis() * HEDGE_DELAY_FRACTION).toLong()
+
+    private val concurrencySemaphore = Semaphore(parallelRequests)
 
     private val client: HttpClient = HttpClient.newBuilder()
         .connectTimeout(Duration.ofMillis(1500))
@@ -57,7 +61,7 @@ class PaymentExternalSystemAdapterImpl(
         .build()
 
     private val slidingWindowRateLimiter = SlidingWindowRateLimiter(
-        (rateLimitPerSec * 0.95).toLong().coerceAtLeast(1),
+        (rateLimitPerSec * 0.85).toLong().coerceAtLeast(1),
         Duration.ofSeconds(1)
     )
 
@@ -95,19 +99,19 @@ class PaymentExternalSystemAdapterImpl(
         updateScope.launch {
             val mutex = paymentMutexes.getOrPut(paymentId) { Mutex() }
             mutex.withLock {
-                repeat(3) { attempt ->
+                while (true) {
                     try {
                         paymentESService.update(paymentId) { block(it) }
-                        return@withLock
+                        break
+                    } catch (_: IllegalArgumentException) {
+                        delay(10)
                     } catch (e: Exception) {
-                        if (attempt == 2) {
-                            logger.error("[$accountName] DB update failed after 3 attempts for payment: $paymentId", e)
-                        } else {
-                            delay(50L * (attempt + 1))
-                        }
+                        logger.error("[$accountName] DB update failed for payment: $paymentId", e)
+                        break
                     }
                 }
             }
+            paymentMutexes.remove(paymentId)
         }
     }
 
@@ -118,7 +122,12 @@ class PaymentExternalSystemAdapterImpl(
         paymentStartedAt: Long,
         deadline: Long
     ) {
-        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
+        if (remainingMillis(deadline) < requestAverageProcessingTime.toMillis()) {
+            logger.debug("[$accountName] Skipping payment $paymentId: not enough time before deadline")
+            return
+        }
+
+        logger.debug("[$accountName] Submitting payment request for payment $paymentId")
 
         val transactionId = UUID.randomUUID()
         incomingRequestsCounter.increment()
@@ -216,6 +225,20 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private suspend fun sendPaymentRequest(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long
+    ): ExternalSysResponse? {
+        concurrencySemaphore.acquire()
+        try {
+            return doSendPaymentRequest(paymentId, amount, transactionId, deadline)
+        } finally {
+            concurrencySemaphore.release()
+        }
+    }
+
+    private suspend fun doSendPaymentRequest(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,

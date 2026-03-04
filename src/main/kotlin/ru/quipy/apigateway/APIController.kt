@@ -84,7 +84,7 @@ class APIController {
         if (createdAt == null) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
                 .header("Retry-After", "1")
-                .build();
+                .build()
         }
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }

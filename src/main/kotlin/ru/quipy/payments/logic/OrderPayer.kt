@@ -39,12 +39,12 @@ class OrderPayer {
         val createdAt = System.currentTimeMillis()
 
         if (deadline <= createdAt) {
-            logger.warn("Payment $paymentId rejected: deadline already passed")
+//            logger.warn("Payment $paymentId rejected: deadline already passed")
             return null
         }
 
         if (!bucketQueue.tick()) {
-            logger.warn("Payment $paymentId rejected: rate limit reached")
+//            logger.warn("Payment $paymentId rejected: rate limit reached")
             return null
         }
 

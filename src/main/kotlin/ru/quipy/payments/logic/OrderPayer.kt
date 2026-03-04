@@ -7,19 +7,18 @@ import org.slf4j.Logger
 import org.slf4j.LoggerFactory
 import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.stereotype.Service
+import ru.quipy.common.utils.LeakingBucketRateLimiter
 import ru.quipy.core.EventSourcingService
 import ru.quipy.payments.api.PaymentAggregate
+import java.time.Duration
 import java.util.*
 import java.util.concurrent.Executors
-import java.util.concurrent.Semaphore
 
 @Service
 class OrderPayer {
 
     companion object {
         val logger: Logger = LoggerFactory.getLogger(OrderPayer::class.java)
-
-        private const val MAX_IN_FLIGHT_PAYMENTS = 5000
     }
 
     @Autowired
@@ -28,7 +27,11 @@ class OrderPayer {
     @Autowired
     private lateinit var paymentService: PaymentService
 
-    private val backpressureSemaphore = Semaphore(MAX_IN_FLIGHT_PAYMENTS)
+    private val bucketQueue = LeakingBucketRateLimiter(
+        rate = 4000,
+        window = Duration.ofMillis(1000),
+        bucketSize = 4000
+    )
 
     private val coroutineScope = CoroutineScope(Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher())
 
@@ -40,8 +43,8 @@ class OrderPayer {
             return null
         }
 
-        if (!backpressureSemaphore.tryAcquire()) {
-            logger.warn("Payment $paymentId rejected: backpressure limit reached")
+        if (!bucketQueue.tick()) {
+            logger.warn("Payment $paymentId rejected: rate limit reached")
             return null
         }
 
@@ -56,8 +59,6 @@ class OrderPayer {
                 paymentService.submitPaymentRequest(paymentId, amount, createdAt, deadline)
             } catch (e: Exception) {
                 logger.error("Payment failed unexpectedly: $paymentId", e)
-            } finally {
-                backpressureSemaphore.release()
             }
         }
 

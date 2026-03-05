@@ -5,6 +5,7 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.asCoroutineDispatcher
 import kotlinx.coroutines.delay
@@ -13,6 +14,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withTimeoutOrNull
 import org.slf4j.LoggerFactory
 import ru.quipy.common.utils.SlidingWindowRateLimiter
 import ru.quipy.core.EventSourcingService
@@ -25,6 +27,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.ThreadLocalRandom
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.pow
@@ -45,6 +48,9 @@ class PaymentExternalSystemAdapterImpl(
         const val RETRY_MAX_MS = 500L
         const val MIN_DEADLINE_BUDGET_MS = 50L
         const val REQUEST_TIMEOUT_MS = 2000L
+        const val MIN_ADAPTIVE_TIMEOUT_MS = 10L
+        const val HEDGE_DELAY_MIN_MS = 50L
+        const val HEDGE_DELAY_MAX_MS = 800L
     }
 
     private val serviceName = properties.serviceName
@@ -66,8 +72,20 @@ class PaymentExternalSystemAdapterImpl(
 
     private val dbExecutor = Executors.newFixedThreadPool(16)
     private val updateScope = CoroutineScope(dbExecutor.asCoroutineDispatcher())
+    private val hedgeScope = CoroutineScope(Executors.newVirtualThreadPerTaskExecutor().asCoroutineDispatcher())
 
     private val paymentMutexes = ConcurrentHashMap<UUID, Mutex>()
+
+    @Volatile
+    private var emaLatency = properties.averageProcessingTime.toMillis().coerceAtLeast(MIN_ADAPTIVE_TIMEOUT_MS)
+
+    private val hedgeDelayMs: Long
+        get() = (emaLatency * 1.5).toLong().coerceIn(HEDGE_DELAY_MIN_MS, HEDGE_DELAY_MAX_MS)
+
+    private fun updateLatency(durationMs: Long) {
+        val alpha = 0.2
+        emaLatency = (alpha * durationMs + (1 - alpha) * emaLatency).toLong()
+    }
 
     private val incomingRequestsCounter: Counter = Counter
         .builder("incoming.requests")
@@ -99,6 +117,11 @@ class PaymentExternalSystemAdapterImpl(
         .tags("account", accountName)
         .register(meterRegistry)
 
+    private val hedgeCounter: Counter = Counter
+        .builder("payment.hedges")
+        .tags("account", accountName)
+        .register(meterRegistry)
+
     private fun safeUpdate(paymentId: UUID, block: (PaymentAggregateState) -> ru.quipy.domain.Event<PaymentAggregate>) {
         updateScope.launch {
             val mutex = paymentMutexes.getOrPut(paymentId) { Mutex() }
@@ -120,8 +143,9 @@ class PaymentExternalSystemAdapterImpl(
     }
 
     private fun retryDelayMs(attempt: Int): Long {
-        val exp = (RETRY_BASE_MS * 2.0.pow((attempt - 1).toDouble())).toLong()
-        return min(exp, RETRY_MAX_MS)
+        val expBackoff = (RETRY_BASE_MS * 2.0.pow((attempt - 1).toDouble())).toLong()
+        val jitter = ThreadLocalRandom.current().nextLong(0, 15)
+        return min(expBackoff + jitter, RETRY_MAX_MS)
     }
 
     override suspend fun performPayment(
@@ -141,7 +165,7 @@ class PaymentExternalSystemAdapterImpl(
             it.logSubmission(true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
         }
 
-        val result = performRequestWithRetry(paymentId, amount, transactionId, deadline, 1)
+        val result = performRequestWithHedgingAndRetry(paymentId, amount, transactionId, deadline)
 
         safeUpdate(paymentId) {
             it.logProcessing(result.success, now(), transactionId, reason = result.message)
@@ -149,36 +173,71 @@ class PaymentExternalSystemAdapterImpl(
         incomingFinishedRequestsCounter.increment()
     }
 
-    private suspend fun performRequestWithRetry(
+    private suspend fun performRequestWithHedgingAndRetry(
         paymentId: UUID,
         amount: Int,
         transactionId: UUID,
         deadline: Long,
-        attempt: Int
     ): PaymentResult {
-        if (remainingMillis(deadline) < MIN_DEADLINE_BUDGET_MS || attempt > MAX_ATTEMPTS) {
-            return PaymentResult(false, "Deadline exceeded or max attempts reached")
+        for (attempt in 1..MAX_ATTEMPTS) {
+            if (remainingMillis(deadline) < MIN_DEADLINE_BUDGET_MS) {
+                return PaymentResult(false, "Deadline exceeded")
+            }
+
+            if (!slidingWindowRateLimiter.tickSuspend(
+                    (remainingMillis(deadline) - MIN_DEADLINE_BUDGET_MS).coerceAtLeast(1),
+                    TimeUnit.MILLISECONDS
+                )
+            ) {
+                return PaymentResult(false, "Rate limit timeout")
+            }
+
+            val result = performHedgedRequest(paymentId, amount, transactionId, deadline)
+
+            if (result.success) {
+                return result
+            }
+
+            if (attempt < MAX_ATTEMPTS && remainingMillis(deadline) > MIN_DEADLINE_BUDGET_MS + retryDelayMs(attempt)) {
+                retryCounter.increment()
+                delay(retryDelayMs(attempt))
+            } else {
+                return result
+            }
+        }
+        return PaymentResult(false, "Max attempts reached")
+    }
+
+    private suspend fun performHedgedRequest(
+        paymentId: UUID,
+        amount: Int,
+        transactionId: UUID,
+        deadline: Long,
+    ): PaymentResult {
+        val deferred = CompletableDeferred<PaymentResult>()
+
+        val primaryJob = hedgeScope.launch {
+            val res = sendRequest(paymentId, amount, transactionId, deadline)
+            deferred.complete(res)
         }
 
-        if (!slidingWindowRateLimiter.tickSuspend(
-                (remainingMillis(deadline) - MIN_DEADLINE_BUDGET_MS).coerceAtLeast(1),
-                TimeUnit.MILLISECONDS
-            )
-        ) {
-            return PaymentResult(false, "Rate limit timeout")
+        val hedgeJob = hedgeScope.launch {
+            delay(hedgeDelayMs)
+            if (!deferred.isCompleted && remainingMillis(deadline) > MIN_DEADLINE_BUDGET_MS) {
+                hedgeCounter.increment()
+                if (slidingWindowRateLimiter.tick()) {
+                    val res = sendRequest(paymentId, amount, transactionId, deadline)
+                    deferred.complete(res)
+                }
+            }
         }
 
-        val result = sendRequest(paymentId, amount, transactionId, deadline)
+        val timeoutMs = (remainingMillis(deadline) - MIN_DEADLINE_BUDGET_MS).coerceAtLeast(1L)
+        val result = withTimeoutOrNull(timeoutMs) { deferred.await() }
+            ?: PaymentResult(false, "Deadline timeout waiting for hedged response")
 
-        if (result.success) {
-            return result
-        }
-
-        if (attempt < MAX_ATTEMPTS && remainingMillis(deadline) > MIN_DEADLINE_BUDGET_MS + retryDelayMs(attempt)) {
-            retryCounter.increment()
-            delay(retryDelayMs(attempt))
-            return performRequestWithRetry(paymentId, amount, transactionId, deadline, attempt + 1)
-        }
+        primaryJob.cancel()
+        hedgeJob.cancel()
 
         return result
     }
@@ -205,6 +264,7 @@ class PaymentExternalSystemAdapterImpl(
 
             val request = HttpRequest.newBuilder()
                 .uri(URI.create(uri))
+                .header("x-idempotency-key", transactionId.toString())
                 .timeout(Duration.ofMillis(timeoutMs))
                 .POST(HttpRequest.BodyPublishers.noBody())
                 .build()
@@ -214,8 +274,9 @@ class PaymentExternalSystemAdapterImpl(
 
             return try {
                 val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
-                val clientRequestFinish = now()
-                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+                val latency = now() - clientRequestStart
+                updateLatency(latency)
+                clientRequestLatency.record(latency, TimeUnit.MILLISECONDS)
                 outgoingFinishedRequestsCounter.increment()
 
                 try {
@@ -225,8 +286,9 @@ class PaymentExternalSystemAdapterImpl(
                     PaymentResult(false, e.message)
                 }
             } catch (e: Exception) {
-                val clientRequestFinish = now()
-                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+                val latency = now() - clientRequestStart
+                updateLatency(latency)
+                clientRequestLatency.record(latency, TimeUnit.MILLISECONDS)
                 outgoingFinishedRequestsCounter.increment()
                 PaymentResult(false, e.message)
             }

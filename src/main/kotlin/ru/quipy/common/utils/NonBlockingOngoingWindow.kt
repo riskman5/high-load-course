@@ -1,7 +1,5 @@
 package ru.quipy.common.utils
 
-import kotlinx.coroutines.delay
-import ru.quipy.payments.logic.now
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -13,20 +11,6 @@ class OngoingWindow(
 
     fun acquire(timeout: Long, unit: TimeUnit) : Boolean =
         window.tryAcquire(unit.toMillis(timeout), TimeUnit.MILLISECONDS);
-
-    suspend fun acquireSuspend(timeout: Long, unit: TimeUnit): Boolean {
-        if (timeout <= 0) return false
-        val start = now()
-        val timeoutMillis = unit.toMillis(timeout)
-
-        while (!window.tryAcquire()) {
-            delay(5)
-            if (now() > start + timeoutMillis) {
-                return false
-            }
-        }
-        return true
-    }
 
     fun release() = window.release()
 

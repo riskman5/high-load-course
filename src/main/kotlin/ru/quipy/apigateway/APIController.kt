@@ -6,9 +6,11 @@ import org.springframework.beans.factory.annotation.Autowired
 import org.springframework.http.HttpStatus
 import org.springframework.http.ResponseEntity
 import org.springframework.web.bind.annotation.*
+import ru.quipy.common.utils.TokenBucketRateLimiter
 import ru.quipy.orders.repository.OrderRepository
 import ru.quipy.payments.logic.OrderPayer
 import java.util.*
+import java.util.concurrent.TimeUnit
 
 @RestController
 class APIController {
@@ -20,6 +22,13 @@ class APIController {
 
     @Autowired
     private lateinit var orderPayer: OrderPayer
+
+    private val apiRateLimiter = TokenBucketRateLimiter(
+        5000,
+        5000,
+        1,
+        TimeUnit.SECONDS
+    )
 
     @PostMapping("/users")
     fun createUser(@RequestBody req: CreateUserRequest): User {
@@ -58,6 +67,12 @@ class APIController {
 
     @PostMapping("/orders/{orderId}/payment")
     fun payOrder(@PathVariable orderId: UUID, @RequestParam deadline: Long): ResponseEntity<PaymentSubmissionDto> {
+        if (!apiRateLimiter.tick()) {
+            val timestamp = System.currentTimeMillis() + 500
+                return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
+                    .header("Retry-After", timestamp.toString()).build()
+        }
+
         val paymentId = UUID.randomUUID()
         val order = orderRepository.findById(orderId)?.let {
             orderRepository.save(it.copy(status = OrderStatus.PAYMENT_IN_PROGRESS))
@@ -66,11 +81,12 @@ class APIController {
 
 
         val createdAt = orderPayer.processPayment(orderId, order.price, paymentId, deadline)
+        val timestamp = System.currentTimeMillis() + 500
         if (createdAt == null) {
             return ResponseEntity.status(HttpStatus.TOO_MANY_REQUESTS)
-                .header("Retry-After", "1")
-                .build();
+                .header("Retry-After", timestamp.toString()).build();
         }
+
         return ResponseEntity.ok(PaymentSubmissionDto(createdAt, paymentId))
     }
 

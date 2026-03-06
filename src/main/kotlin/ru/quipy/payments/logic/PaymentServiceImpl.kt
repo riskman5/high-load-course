@@ -3,7 +3,6 @@ package ru.quipy.payments.logic
 import org.slf4j.LoggerFactory
 import org.springframework.stereotype.Service
 import java.util.*
-import java.util.concurrent.CompletableFuture
 
 
 @Service
@@ -14,11 +13,16 @@ class PaymentSystemImpl(
         val logger = LoggerFactory.getLogger(PaymentSystemImpl::class.java)
     }
 
-    override fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) : CompletableFuture<Void> {
-        val futures = paymentAccounts.map { account ->
-            account.performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
-        }
+    private val sortedAccounts = paymentAccounts
+        .filter { it.isEnabled() }
+        .sortedBy { it.price() }
 
-        return CompletableFuture.allOf(*futures.toTypedArray())
+    override suspend fun submitPaymentRequest(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
+        val account = sortedAccounts.firstOrNull()
+        if (account == null) {
+            logger.error("No enabled payment accounts available for payment $paymentId")
+            return
+        }
+        account.performPayment(paymentId, amount, paymentStartedAt, deadline)
     }
 }

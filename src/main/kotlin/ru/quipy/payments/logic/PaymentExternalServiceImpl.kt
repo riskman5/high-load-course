@@ -7,7 +7,6 @@ import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
 import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
-import kotlinx.coroutines.selects.select
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -44,6 +43,7 @@ class PaymentExternalSystemAdapterImpl(
         const val MIN_DEADLINE_BUDGET_MS = 50L
         const val REQUEST_TIMEOUT_MS = 2000L
         const val HEDGE_DELAY_MS = 200L
+        const val MAX_HEDGES = 5
     }
 
     private val serviceName = properties.serviceName
@@ -207,64 +207,68 @@ class PaymentExternalSystemAdapterImpl(
                     "&paymentId=$paymentId" +
                     "&amount=$amount"
 
-
-            val canHedge = timeoutMs > HEDGE_DELAY_MS + MIN_DEADLINE_BUDGET_MS
-
             val clientRequestStart = now()
             outgoingRequestsCounter.increment()
 
-            val primaryRequest = buildRequest(uri, transactionId, timeoutMs)
-            val primaryFuture = client.sendAsync(primaryRequest, HttpResponse.BodyHandlers.ofString())
+            val maxPossibleHedges = ((timeoutMs - MIN_DEADLINE_BUDGET_MS) / HEDGE_DELAY_MS)
+                .coerceIn(1, MAX_HEDGES.toLong()).toInt()
 
             return try {
-                if (canHedge) {
-                    coroutineScope {
-                        val primaryDeferred = async { primaryFuture.await() }
+                coroutineScope {
+                    val completableResult = CompletableDeferred<PaymentResult>()
+                    val deferreds = mutableListOf<Deferred<Unit>>()
+                    val futures = mutableListOf<java.util.concurrent.CompletableFuture<HttpResponse<String>>>()
 
-                        val hedgeDeferred = async {
-                            delay(HEDGE_DELAY_MS)
-                            if (primaryDeferred.isCompleted) {
-                                return@async null
+                    for (i in 0 until maxPossibleHedges) {
+                        val deferred = async {
+                            if (i > 0) {
+                                delay(HEDGE_DELAY_MS * i)
+                                if (completableResult.isCompleted) return@async
+                                hedgeCounter.increment()
+                                outgoingRequestsCounter.increment()
+                                logger.info("[$accountName] Sending hedge #$i for payment $paymentId, txId: $transactionId")
                             }
-                            hedgeCounter.increment()
-                            outgoingRequestsCounter.increment()
-                            logger.info("[$accountName] Sending hedge request for payment $paymentId, txId: $transactionId")
 
-                            val hedgeTimeoutMs = remainingMillis(deadline)
+                            val reqTimeoutMs = remainingMillis(deadline)
                                 .coerceAtMost(REQUEST_TIMEOUT_MS)
                                 .coerceAtLeast(1L)
-                            val hedgeRequest = buildRequest(uri, transactionId, hedgeTimeoutMs)
+                            val request = buildRequest(uri, transactionId, reqTimeoutMs)
+                            val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                            synchronized(futures) { futures.add(future) }
+
                             try {
-                                client.sendAsync(hedgeRequest, HttpResponse.BodyHandlers.ofString()).await()
+                                val response = future.await()
+                                val result = parseResponse(response)
+                                if (result.success) {
+                                    completableResult.complete(result)
+                                }
                             } catch (_: Exception) {
-                                null
                             }
                         }
-
-                        val result = selectFirstSuccessful(primaryDeferred, hedgeDeferred)
-
-                        val clientRequestFinish = now()
-                        clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
-                        outgoingFinishedRequestsCounter.increment()
-
-                        primaryDeferred.cancel()
-                        hedgeDeferred.cancel()
-                        primaryFuture.cancel(true)
-
-                        result
+                        deferreds.add(deferred)
                     }
-                } else {
-                    val response = primaryFuture.await()
+
+
+                    launch {
+                        deferreds.forEach { runCatching { it.await() } }
+                        completableResult.complete(PaymentResult(false, "All hedge attempts failed"))
+                    }
+
+                    val result = completableResult.await()
+
                     val clientRequestFinish = now()
                     clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
                     outgoingFinishedRequestsCounter.increment()
-                    parseResponse(response)
+
+                    deferreds.forEach { it.cancel() }
+                    synchronized(futures) { futures.forEach { it.cancel(true) } }
+
+                    result
                 }
             } catch (e: Exception) {
                 val clientRequestFinish = now()
                 clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
                 outgoingFinishedRequestsCounter.increment()
-                primaryFuture.cancel(true)
                 PaymentResult(false, e.message)
             }
         } finally {
@@ -291,36 +295,6 @@ class PaymentExternalSystemAdapterImpl(
     }
 
 
-    private suspend fun selectFirstSuccessful(
-        primaryDeferred: Deferred<HttpResponse<String>>,
-        hedgeDeferred: Deferred<HttpResponse<String>?>
-    ): PaymentResult {
-        val firstResponse = select {
-            primaryDeferred.onAwait { it }
-            hedgeDeferred.onAwait { it }
-        }
-
-        if (firstResponse != null) {
-            val result = parseResponse(firstResponse)
-            if (result.success) return result
-
-            val secondResponse = try {
-                if (primaryDeferred.isCompleted) hedgeDeferred.await() else primaryDeferred.await()
-            } catch (_: Exception) { null }
-
-            if (secondResponse != null) {
-                val secondResult = parseResponse(secondResponse)
-                if (secondResult.success) return secondResult
-            }
-            return result
-        }
-
-        return try {
-            parseResponse(primaryDeferred.await())
-        } catch (e: Exception) {
-            PaymentResult(false, e.message)
-        }
-    }
 
     private fun remainingMillis(deadline: Long): Long =
         (deadline - now()).coerceAtLeast(0L)

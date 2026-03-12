@@ -5,10 +5,12 @@ Content-Type: application/json
 {
   "serviceName": "{{serviceName}}",
   "token": "{{token}}",
-  "ratePerSecond": 5,
-  "testCount": 1000,
-  "processingTimeMillis": 6000,
-  "accounts": "acc-7"
+  "branch": "hw-11",
+  "accounts": "acc-22",
+  "ratePerSecond": 100,
+  "testCount": 20000,
+  "processingTimeMillis": 1500,
+   "onPremises": true
 }
 
 ### Stop running test to save time and resources

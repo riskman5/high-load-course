@@ -43,7 +43,7 @@ class PaymentExternalSystemAdapterImpl(
         const val RETRY_MAX_MS = 500L
         const val MIN_DEADLINE_BUDGET_MS = 50L
         const val REQUEST_TIMEOUT_MS = 2000L
-        const val HEDGE_DELAY_MS = 400L
+        const val HEDGE_DELAY_MS = 300L
     }
 
     private val serviceName = properties.serviceName

@@ -5,11 +5,8 @@ import com.fasterxml.jackson.module.kotlin.registerKotlinModule
 import io.micrometer.core.instrument.Counter
 import io.micrometer.core.instrument.MeterRegistry
 import io.micrometer.core.instrument.Timer
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.asCoroutineDispatcher
-import kotlinx.coroutines.delay
+import kotlinx.coroutines.*
 import kotlinx.coroutines.future.await
-import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.Semaphore
 import kotlinx.coroutines.sync.withLock
@@ -45,6 +42,8 @@ class PaymentExternalSystemAdapterImpl(
         const val RETRY_MAX_MS = 500L
         const val MIN_DEADLINE_BUDGET_MS = 50L
         const val REQUEST_TIMEOUT_MS = 2000L
+        const val HEDGE_DELAY_MS = 200L
+        const val MAX_HEDGES = 5
     }
 
     private val serviceName = properties.serviceName
@@ -96,6 +95,11 @@ class PaymentExternalSystemAdapterImpl(
 
     private val retryCounter: Counter = Counter
         .builder("payment.retries")
+        .tags("account", accountName)
+        .register(meterRegistry)
+
+    private val hedgeCounter: Counter = Counter
+        .builder("payment.hedged.requests")
         .tags("account", accountName)
         .register(meterRegistry)
 
@@ -203,26 +207,63 @@ class PaymentExternalSystemAdapterImpl(
                     "&paymentId=$paymentId" +
                     "&amount=$amount"
 
-            val request = HttpRequest.newBuilder()
-                .uri(URI.create(uri))
-                .timeout(Duration.ofMillis(timeoutMs))
-                .POST(HttpRequest.BodyPublishers.noBody())
-                .build()
-
             val clientRequestStart = now()
             outgoingRequestsCounter.increment()
 
-            return try {
-                val response = client.sendAsync(request, HttpResponse.BodyHandlers.ofString()).await()
-                val clientRequestFinish = now()
-                clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
-                outgoingFinishedRequestsCounter.increment()
+            val maxPossibleHedges = ((timeoutMs - MIN_DEADLINE_BUDGET_MS) / HEDGE_DELAY_MS)
+                .coerceIn(1, MAX_HEDGES.toLong()).toInt()
 
-                try {
-                    val body = mapper.readValue(response.body(), ExternalSysResponse::class.java)
-                    PaymentResult(body.result, body.message)
-                } catch (e: Exception) {
-                    PaymentResult(false, e.message)
+            return try {
+                coroutineScope {
+                    val completableResult = CompletableDeferred<PaymentResult>()
+                    val deferreds = mutableListOf<Deferred<Unit>>()
+                    val futures = mutableListOf<java.util.concurrent.CompletableFuture<HttpResponse<String>>>()
+
+                    for (i in 0 until maxPossibleHedges) {
+                        val deferred = async {
+                            if (i > 0) {
+                                delay(HEDGE_DELAY_MS * i)
+                                if (completableResult.isCompleted) return@async
+                                hedgeCounter.increment()
+                                outgoingRequestsCounter.increment()
+                                logger.info("[$accountName] Sending hedge #$i for payment $paymentId, txId: $transactionId")
+                            }
+
+                            val reqTimeoutMs = remainingMillis(deadline)
+                                .coerceAtMost(REQUEST_TIMEOUT_MS)
+                                .coerceAtLeast(1L)
+                            val request = buildRequest(uri, transactionId, reqTimeoutMs)
+                            val future = client.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                            synchronized(futures) { futures.add(future) }
+
+                            try {
+                                val response = future.await()
+                                val result = parseResponse(response)
+                                if (result.success) {
+                                    completableResult.complete(result)
+                                }
+                            } catch (_: Exception) {
+                            }
+                        }
+                        deferreds.add(deferred)
+                    }
+
+
+                    launch {
+                        deferreds.forEach { runCatching { it.await() } }
+                        completableResult.complete(PaymentResult(false, "All hedge attempts failed"))
+                    }
+
+                    val result = completableResult.await()
+
+                    val clientRequestFinish = now()
+                    clientRequestLatency.record(clientRequestFinish - clientRequestStart, TimeUnit.MILLISECONDS)
+                    outgoingFinishedRequestsCounter.increment()
+
+                    deferreds.forEach { it.cancel() }
+                    synchronized(futures) { futures.forEach { it.cancel(true) } }
+
+                    result
                 }
             } catch (e: Exception) {
                 val clientRequestFinish = now()
@@ -234,6 +275,26 @@ class PaymentExternalSystemAdapterImpl(
             concurrencySemaphore.release()
         }
     }
+
+    private fun buildRequest(uri: String, transactionId: UUID, timeoutMs: Long): HttpRequest {
+        return HttpRequest.newBuilder()
+            .uri(URI.create(uri))
+            .timeout(Duration.ofMillis(timeoutMs))
+            .header("x-idempotency-key", transactionId.toString())
+            .POST(HttpRequest.BodyPublishers.noBody())
+            .build()
+    }
+
+    private fun parseResponse(response: HttpResponse<String>): PaymentResult {
+        return try {
+            val body = mapper.readValue(response.body(), ExternalSysResponse::class.java)
+            PaymentResult(body.result, body.message)
+        } catch (e: Exception) {
+            PaymentResult(false, e.message)
+        }
+    }
+
+
 
     private fun remainingMillis(deadline: Long): Long =
         (deadline - now()).coerceAtLeast(0L)
